@@ -1,322 +1,314 @@
-import torch
-import torch.nn as nn
-import numpy as np
-import librosa
+"""
+Batch processing script for AAD+DAST SemantiCodec
+Processes audio files with frame selection based on importance scores
+"""
+
+import os
+import tempfile
 from pathlib import Path
-from scipy import signal
+import torch
 import soundfile as sf
+import gc
 
-import warnings
-warnings.filterwarnings("ignore")
 
-from pesq import pesq
-from pystoi import stoi
+# Import the novel codec
+from attention_token_allocation import AADDASTSemanticCodec, clear_gpu_memory
 
-#pip install pesq, pystoi
 
-class ComplexityAnalyzer:
-#analyze audio complexity
-    def __init__(self, sr=16000):
-        self.sr = sr
-        
-    def analyze_audio(self, audio_path, target_frames):
-        audio, sr = librosa.load(audio_path, sr=self.sr, mono=True)        
-        hop_length = max(64, min(512, int(len(audio) / target_frames)))        
-        complexity_scores = []
-        
-        for i in range(target_frames):
-            start_sample = i * hop_length
-            end_sample = min(start_sample + hop_length * 2, len(audio))
-            frame = audio[start_sample:end_sample]
-            if len(frame) == 0:
-                complexity_scores.append(0.0)
-                continue
-            spectral_complexity = self.spectral_complexity(frame)
-            temporal_complexity = self.temporal_complexity(frame)
-            entropy_complexity = self.spectral_entropy(frame)
-            
-            # Weighted combination - weights need empirical validation
-            combined_complexity = (
-                0.4 * spectral_complexity +    
-                0.3 * temporal_complexity +       
-                0.3 * entropy_complexity        
-            )
-            
-            complexity_scores.append(combined_complexity)
-        
-        return np.array(complexity_scores)
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+ORIGINAL_DIR = Path("data/original")
+REPLACED_DIR = Path("data/replaced")
+
+# Codec settings
+TOKEN_RATE = 100
+VOCAB_SIZE = 16384
+
+# AAD+DAST settings
+ALPHA = 0.5         # Fusion parameter: 0.0=AAD only, 0.5=balanced, 1.0=attention only
+KEEP_RATIO = 0.7    # Keep 70% of frames, drop 30%
+
+
+# ============================================================================
+# LALM INITIALIZATION
+# ============================================================================
+
+def load_lalm():
+    """
+    Load LALM with proper configuration for AAD+DAST (Colab Pro optimized)
+    Uses 8-bit quantization
+    """
+    from transformers import Qwen2AudioForConditionalGeneration, AutoProcessor, BitsAndBytesConfig
     
-    def spectral_complexity(self, frame):
-        if len(frame) < 64:
-            return 0.0
-            
-        try:
-            centroids = librosa.feature.spectral_centroid(
-                y=frame, sr=self.sr, hop_length=64
-            )[0]
-            if len(centroids) > 1:
-                complexity = np.std(centroids) / (np.mean(centroids) + 1e-8)
-                return min(complexity, 1.0)
-            else:
-                return 0.0
-        except:
-            return 0.0
+    print("\n🧠 Loading Qwen2-Audio-7B with 8-bit quantization...")
     
-    def temporal_complexity(self, frame):
-        if len(frame) < 128:
-            return 0.0
-        try:
-            window_size = len(frame) // 4
-            zcr_values = []
-            for i in range(0, len(frame) - window_size, window_size // 2):
-                window = frame[i:i + window_size]
-                zcr = librosa.feature.zero_crossing_rate(window)[0][0]
-                zcr_values.append(zcr)
-            if len(zcr_values) > 1:
-                complexity = np.std(zcr_values) / (np.mean(zcr_values) + 1e-8)
-                return min(complexity, 1.0)
-            else:
-                return 0.0
-        except:
-            return 0.0
+    model_name = "Qwen/Qwen2-Audio-7B-Instruct"
     
-    def spectral_entropy(self, frame):
-        if len(frame) < 64:
-            return 0.0
-        try:
-            freqs, psd = signal.welch(frame, fs=self.sr, nperseg=min(256, len(frame)))            
-            psd_norm = psd / (np.sum(psd) + 1e-8)
-            entropy = -np.sum(psd_norm * np.log(psd_norm + 1e-8))
-            max_entropy = np.log(len(psd_norm))
-            normalized_entropy = entropy / max_entropy if max_entropy > 0 else 0.0
-            return normalized_entropy
-        except:
-            return 0.0
+    # Simple 8-bit config (no CPU offload needed on Colab Pro)
+    quantization_config = BitsAndBytesConfig(
+        load_in_8bit=True,
+        bnb_8bit_compute_dtype=torch.float16
+    )
+    
+    # Load model
+    model = Qwen2AudioForConditionalGeneration.from_pretrained(
+        model_name,
+        quantization_config=quantization_config,
+        device_map="auto",
+        torch_dtype=torch.float16,
+        trust_remote_code=True,
+        attn_implementation="eager"
+    )
+    
+    processor = AutoProcessor.from_pretrained(
+        model_name,
+        trust_remote_code=True
+    )
+    
+    model.eval()
+    
+    print(f"✅ LALM loaded: {model_name}")
+    print(f"✅ Attention mode: eager (supports AAD+DAST)")
+    print(f"📊 GPU memory: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+    
+    return model, processor
 
 
-class QualityMetrics:    
-    def __init__(self, sr=16000):
-        self.sr = sr
-    
-    def evaluate_quality(self, reference_audio, degraded_audio):      
-        min_len = min(len(reference_audio), len(degraded_audio))
-        ref = reference_audio[:min_len]
-        deg = degraded_audio[:min_len]
-        
-        metrics = {}
-        
-        # PESQ (Perceptual Evaluation of Speech Quality) range 1.0-4.5
-        pesq_score = pesq(self.sr, ref, deg, 'wb')
-        metrics['pesq'] = {
-            'score': pesq_score,
-            'interpretation': self.pesq(pesq_score)
-        }
 
-        # STOI (Short-Time Objective Intelligibility) range 0.0-1.0
-        stoi_score = stoi(ref, deg, self.sr)
-        metrics['stoi'] = {
-            'score': stoi_score,
-            'interpretation': self.stoi(stoi_score)
-        }
-        
-        return metrics
+
+def unload_lalm(model, processor):
+    """Unload LALM to free GPU memory"""
+    print("\n🗑️ Unloading LALM...")
+    del model
+    del processor
+    clear_gpu_memory()
+    print(f"📊 GPU memory after cleanup: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+
+
+# ============================================================================
+# PROCESSING FUNCTIONS
+# ============================================================================
+
+def process_audio(input_path: Path, output_path: Path, 
+                  lalm_model, lalm_processor,
+                  question: str = "What sounds are in this audio?",
+                  alpha: float = ALPHA,
+                  keep_ratio: float = KEEP_RATIO):
+    """
+    Process single audio file with AAD+DAST codec
     
-    def pesq(self, score):
-        if score >= 4.0:
-            return "Excellent quality"
-        elif score >= 3.0:
-            return "Good quality"
-        elif score >= 2.0:
-            return "Fair quality"
+    Pipeline:
+    1. Compute importance with LALM
+    2. Select important frames
+    3. Unload LALM
+    4. Load SemantiCodec
+    5. Encode selected frames
+    6. Decode and save
+    """
+    print(f"\n{'='*70}")
+    print(f"Processing: {input_path.name}")
+    print(f"{'='*70}")
+    
+    # Initialize codec (doesn't load SemantiCodec yet)
+    codec = AADDASTSemanticCodec(
+        aad_model=lalm_model,
+        aad_processor=lalm_processor,
+        alpha=alpha,
+        keep_ratio=keep_ratio
+    )
+    
+    try:
+        # Phase 1-2: Compute importance and select frames (uses LALM)
+        result = codec.encode(str(input_path), question)
+        
+        # Phase 3: Encode selected frames (will load SemantiCodec)
+        # Note: In this single-file version, LALM is still loaded
+        # For batch processing, LALM would be unloaded here
+        result = codec.encode_selected_frames(result)
+        
+        # Decode to audio
+        waveform = codec.decode(result)
+        
+        # Save output
+        if isinstance(waveform, torch.Tensor):
+            waveform_np = waveform.cpu().numpy()
         else:
-            return "Poor quality"
-    
-    def stoi(self, score):
-        if score >= 0.9:
-            return "High intelligibility"
-        elif score >= 0.7:
-            return "Good intelligibility"
-        elif score >= 0.5:
-            return "Fair intelligibility"
-        else:
-            return "Poor intelligibility"
+            waveform_np = waveform
+        
+        sf.write(str(output_path), waveform_np[0, 0], 16000)
+        
+        # Print statistics
+        if isinstance(result, dict):
+            print(f"\n✅ Success!")
+            print(f"  → Compression: {result['compression_ratio']:.1%} frames kept")
+            print(f"  → Original frames: {result['num_frames']}")
+            print(f"  → Selected frames: {len(result['selected_indices'])}")
+            print(f"  → Final tokens: {result['tokens'].shape[1]}")
+            print(f"  → Saved: {output_path}")
+        
+    except Exception as e:
+        print(f"  ✗ Failed: {input_path.name}")
+        print(f"  Error: {e}")
+        import traceback
+        traceback.print_exc()
 
 
-class AttentionProcessor:
-#process tokens using entropy
+def process_video(input_path: Path, output_path: Path,
+                  lalm_model, lalm_processor,
+                  question: str = "What sounds are in this audio?",
+                  alpha: float = ALPHA,
+                  keep_ratio: float = KEEP_RATIO):
+    """
+    Process video file: extract audio, compress with AAD+DAST, mux back
+    """
+    import ffmpeg
     
-    def __init__(self):
-        self.complexity_analyzer = ComplexityAnalyzer()
-        self.quality_metrics = QualityMetrics()
+    print(f"\n{'='*70}")
+    print(f"Processing video: {input_path.name}")
+    print(f"{'='*70}")
     
-    def process_tokens(self, audio_path, tokens, codec):        
-        B, T, C = tokens.shape
-        
-        complexity_scores = self.complexity_analyzer.analyze_audio(audio_path, T)
-        
-        #baseline quality
-        original_audio, sr = librosa.load(audio_path, sr=16000, mono=True)
-        baseline_reconstruction = codec.decode(tokens)
-        baseline_audio = self._extract_audio_array(baseline_reconstruction)
-        
-        min_len = min(len(original_audio), len(baseline_audio))
-        original_audio = original_audio[:min_len]
-        baseline_audio = baseline_audio[:min_len]
-        
-        baseline_quality = self.quality_metrics.evaluate_quality(original_audio, baseline_audio)
-        baseline_pesq = baseline_quality.get('pesq', {}).get('score', 0)
-        
-        print(f"Baseline PESQ: {baseline_pesq:.3f}")
-        
-        #entropy-based token selection
-        processed_tokens = self._entropy_based_selection(tokens, complexity_scores)        
-        processed_reconstruction = codec.decode(processed_tokens)
-        processed_audio = self._extract_audio_array(processed_reconstruction)[:min_len]
-        processed_quality = self.quality_metrics.evaluate_quality(original_audio, processed_audio)
-        processed_pesq = processed_quality.get('pesq', {}).get('score', 0)
-        
-        improvement = processed_pesq - baseline_pesq
-        print(f"Processed PESQ: {processed_pesq:.3f} (change: {improvement:+.3f})")
-        
-        analysis_data = {
-            'complexity_scores': complexity_scores,
-            'baseline_quality': baseline_quality,
-            'processed_quality': processed_quality,
-            'pesq_improvement': improvement
-        }
-        
-        return processed_tokens, analysis_data
-    
-    def _entropy_based_selection(self, tokens, complexity_scores):
-        processed_tokens = tokens.clone()
-        
-        entropies = []
-        window_size = 5
-        
-        for t in range(len(complexity_scores)):
-            start = max(0, t - window_size // 2)
-            end = min(len(complexity_scores), t + window_size // 2 + 1)
-            
-            #calculate entropy of token values in window
-            window_tokens = tokens[0, start:end, :].cpu().flatten().numpy()
-            unique_tokens, counts = np.unique(window_tokens, return_counts=True)
-            probabilities = counts / len(window_tokens)
-            entropy = -np.sum(probabilities * np.log(probabilities + 1e-8))
-            entropies.append(entropy)
-        
-        entropies = np.array(entropies)
-        
-        #low entropy AND low complexity
-        low_entropy_threshold = np.percentile(entropies, 30)
-        low_complexity_threshold = np.percentile(complexity_scores, 30)
-        
-        modifications = 0
-        for t in range(len(complexity_scores)):
-            if (entropies[t] < low_entropy_threshold and 
-                complexity_scores[t] < low_complexity_threshold):
-                
-                for c in range(tokens.shape[2]):
-                    current_token = tokens[0, t, c].item()
-                    #quantization (2-bit reduction)
-                    quantized = ((current_token + 2) // 4) * 4
-                    processed_tokens[0, t, c] = min(16383, quantized)
-                    if quantized != current_token:
-                        modifications += 1
+    REPLACED_DIR.mkdir(parents=True, exist_ok=True)
 
-        print(f"Entropy-based modifications: {modifications} tokens")
-        return processed_tokens
-    
-    def _extract_audio_array(self, audio_tensor):
-        if isinstance(audio_tensor, torch.Tensor):
-            audio_array = audio_tensor.cpu().numpy()
-        else:
-            audio_array = audio_tensor
-        
-        return audio_array.flatten()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        extracted_audio = tmpdir / "extracted.wav"
+        processed_audio = tmpdir / "processed.wav"
 
+        # Extract audio
+        print("  → Extracting audio...")
+        (
+            ffmpeg
+            .input(str(input_path))
+            .output(str(extracted_audio), ac=1, ar=16000)
+            .overwrite_output()
+            .run(quiet=True)
+        )
 
-class ModifiedSemantiCodec(nn.Module):
-#Semanticodec modified with dynamic token allocation    
-    def __init__(self, token_rate=100, semantic_vocab_size=16384, force_cpu=True):
-        super().__init__()
-        
-        if force_cpu:
-            self.device = torch.device("cpu")
-        else:
-            if torch.cuda.is_available():
-                self.device = torch.device("cuda")
-        
-        from semanticodec import SemantiCodec as OriginalSemantiCodec
-        self.base_codec = OriginalSemantiCodec(
-            token_rate=token_rate,
-            semantic_vocab_size=semantic_vocab_size
+        # Process with AAD+DAST
+        print("  → Processing with AAD+DAST...")
+        codec = AADDASTSemanticCodec(
+            aad_model=lalm_model,
+            aad_processor=lalm_processor,
+            alpha=alpha,
+            keep_ratio=keep_ratio
         )
         
-        self.entropy_processor = AttentionProcessor()
-    
-    def encode(self, filepath):
-        base_tokens = self.base_codec.encode(filepath)
-        try:
-            processed_tokens, analysis_data = self.entropy_processor.process_tokens(
-                filepath, base_tokens, self.base_codec
+        result = codec.encode(str(extracted_audio), question)
+        result = codec.encode_selected_frames(result)
+        waveform = codec.decode(result)
+        
+        if isinstance(waveform, torch.Tensor):
+            waveform_np = waveform.cpu().numpy()
+        else:
+            waveform_np = waveform
+        
+        sf.write(str(processed_audio), waveform_np[0, 0], 16000)
+        
+        # Print stats
+        if isinstance(result, dict):
+            print(f"  → Compression: {result['compression_ratio']:.1%} frames kept")
+
+        # Mux video + processed audio
+        print("  → Muxing video and audio...")
+        video_stream = ffmpeg.input(str(input_path))
+        new_audio_stream = ffmpeg.input(str(processed_audio))
+
+        (
+            ffmpeg
+            .output(
+                video_stream.video,
+                new_audio_stream.audio,
+                str(output_path),
+                vcodec="copy",
+                acodec="aac",
+                shortest=None
             )
-            return {
-                'tokens': processed_tokens,
-                'base_tokens': base_tokens,
-                'analysis': analysis_data
-            }
-            
-        except Exception as e:
-            print(f"processing failed: {e}")
-            import traceback
-            traceback.print_exc()
-            return base_tokens
-    
-    def decode(self, encoded_data):
-        if isinstance(encoded_data, dict):
-            tokens = encoded_data.get('tokens', encoded_data.get('base_tokens'))
-        else:
-            tokens = encoded_data
-        
-        target_device = next(self.base_codec.encoder.parameters()).device
-        if tokens.device != target_device:
-            tokens = tokens.to(target_device)
-        
-        return self.base_codec.decode(tokens)
+            .overwrite_output()
+            .run(quiet=True)
+        )
+
+    print(f"  ✅ Saved: {output_path}")
 
 
-def test_attention():
-    audio_path = "overview_and_setup/data/original/avhbench_example.wav"
-    
-    if not Path(audio_path).exists():
-        print(f"Audio file not found: {audio_path}")
-        return False
-    
-    model = ModifiedSemantiCodec(force_cpu=True)
-    
-    result = model.encode(audio_path)
-    
-    if isinstance(result, dict) and 'analysis' in result:
-        analysis = result['analysis']
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def main():
+    """
+    Main processing loop
+    Processes all audio/video files in ORIGINAL_DIR
+    """
+    if not ORIGINAL_DIR.exists():
+        raise FileNotFoundError(f"Input folder not found: {ORIGINAL_DIR.resolve()}")
+
+    REPLACED_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Load LALM once for all files
+    lalm_model, lalm_processor = load_lalm()
+
+    try:
+        # Find files
+        mp4s, wavs = [], []
+        for p in ORIGINAL_DIR.iterdir():
+            if p.suffix.lower() == ".mp4":
+                mp4s.append(p)
+            elif p.suffix.lower() == ".wav":
+                wavs.append(p)
+            else:
+                print(f"Skipping: {p.name} (not wav/mp4)")
+
+        mp4s = sorted(mp4s)
+        wavs = sorted(wavs)
+
+        if not mp4s and not wavs:
+            print(f"No .mp4/wav files found in {ORIGINAL_DIR.resolve()}")
+            return
+
+        print(f"\nFound {len(wavs)} wav files and {len(mp4s)} mp4 files")
+        print(f"Settings:")
+        print(f"  - Alpha (AAD+DAST fusion): {ALPHA}")
+        print(f"  - Keep ratio: {KEEP_RATIO}")
+        print(f"  - Token rate: {TOKEN_RATE}")
+        print("="*70)
+
+        # Process WAV files
+        for src in wavs:
+            dst = REPLACED_DIR / src.name
+            try:
+                process_audio(
+                    src, dst, 
+                    lalm_model, lalm_processor,
+                    question="What sounds are in this audio?",
+                    alpha=ALPHA,
+                    keep_ratio=KEEP_RATIO
+                )
+            except Exception as e:
+                print(f"  ✗ Failed: {src.name} - {e}")
+
+        # Process MP4 files
+        for src in mp4s:
+            dst = REPLACED_DIR / src.name
+            try:
+                process_video(
+                    src, dst,
+                    lalm_model, lalm_processor,
+                    question="What sounds are in this audio?",
+                    alpha=ALPHA,
+                    keep_ratio=KEEP_RATIO
+                )
+            except Exception as e:
+                print(f"  ✗ Failed: {src.name} - {e}")
+
+        print("\n" + "="*70)
+        print("Processing complete!")
         
-        print("\nResults:")
-        print(f"  Baseline PESQ: {analysis['baseline_quality']['pesq']['score']:.3f}")
-        print(f"  Modified PESQ: {analysis['processed_quality']['pesq']['score']:.3f}")
-        print(f"  Improvement: {analysis['pesq_improvement']:+.3f}")
-        
-        print(f"\n  Baseline STOI: {analysis['baseline_quality']['stoi']['score']:.3f}")
-        print(f"  Processed STOI: {analysis['processed_quality']['stoi']['score']:.3f}")
-        
-        if analysis['pesq_improvement'] >= -0.05:  # Within 0.05 PESQ units
-            print("\n SUCCESS: Quality preserved within acceptable range")
-            return True
-        else:
-            print(f"\n Quality degradation: {analysis['pesq_improvement']:.3f}")
-            return False
-    else:
-        print("processing failed")
-        return False
+    finally:
+        # Always clean up LALM
+        unload_lalm(lalm_model, lalm_processor)
 
 
-if __name__ == "__main__":        
-    success = test_attention()
+if __name__ == "__main__":
+    main()
